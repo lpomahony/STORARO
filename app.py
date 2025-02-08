@@ -4,20 +4,17 @@ import numpy as np
 from ultralytics import YOLO
 from diffusers import MarigoldDepthPipeline
 import matplotlib.pyplot as plt
-import torch  # Import torch at the top level
-
+import torch
 
 @st.cache_resource()
 def load_yolo_model():
     return YOLO('yolov8n.pt')
 
-
 @st.cache_resource()
 def load_marigold_model():
-    # No need to import torch here, it's already imported globally
     return MarigoldDepthPipeline.from_pretrained("prs-eth/marigold-depth-v1-0", torch_dtype=torch.float32)
 
-
+# ... (detect_objects, draw_boxes_and_grid, and other analysis functions remain the same) ...
 def detect_objects(image, model):
     results = model(image)
     boxes = []
@@ -28,7 +25,6 @@ def detect_objects(image, model):
             boxes.append((int(x1), int(y1), int(x2 - x1), int(y2 - y1)))
             class_ids.append(int(box.cls[0].item()))
     return boxes, class_ids
-
 
 def draw_boxes_and_grid(image, boxes, class_ids, model):
     annotated_image = image.copy()
@@ -45,21 +41,18 @@ def draw_boxes_and_grid(image, boxes, class_ids, model):
         cv2.putText(annotated_image, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
     return annotated_image
 
-
 def estimate_depth_marigold(image):
     """Estimates depth using Marigold."""
     depth_estimator = load_marigold_model()
     with torch.no_grad():
         output = depth_estimator(image)
         depth_map = output.prediction
-        depth_map = np.squeeze(depth_map)  # Remove singleton dimensions
+        depth_map = np.squeeze(depth_map)
     return depth_map
 
 def visualize_depth(depth_map, colormap=cv2.COLORMAP_VIRIDIS):
-    """Visualizes the depth map with a specified colormap."""
     depth_colormap = cv2.applyColorMap(cv2.normalize(depth_map, None, 255, 0, cv2.NORM_MINMAX, cv2.CV_8U), colormap)
     return depth_colormap
-
 def calculate_object_depth_layer(depth_map, box, num_layers=3):
     x, y, w, h = box
     object_region = depth_map[y:y+h, x:x+w]
@@ -140,52 +133,109 @@ def perform_depth_layer_analysis(boxes, class_ids, model, depth_map):
         analysis_results.append(f"{label} is in the {layer_names[layer]}")
     return analysis_results
 
+def delight_image(image, depth_map):
+    """
+    Performs a simplified de-lighting operation, combining depth-based
+    division with bilateral filtering and CLAHE.
+    """
+
+    # 1. Normalize and Invert Depth Map (as a proxy for lighting)
+    depth_map_normalized = cv2.normalize(depth_map, None, 0, 1, cv2.NORM_MINMAX)
+    depth_map_inverted = 1 - depth_map_normalized
+    depth_map_inverted = depth_map_inverted + 0.01  # Avoid division by zero
+
+
+    # Ensure the depth map is the same size as the image and has 3 channels.
+    depth_map_inverted = np.squeeze(depth_map_inverted)
+    if depth_map_inverted.ndim == 2:
+        depth_map_inverted_rgb = cv2.cvtColor(depth_map_inverted.astype(np.float32), cv2.COLOR_GRAY2BGR)
+    elif depth_map_inverted.ndim == 3:
+        depth_map_inverted_rgb = depth_map_inverted
+    else:
+        raise ValueError("Depth map must be 2D (grayscale) or 3D")
+
+    # 2. Divide Image by (Inverted) Depth
+    image = image.astype(np.float32) / 255.0  # Normalize image to [0, 1]
+    delit_image = image / depth_map_inverted_rgb
+    delit_image = np.clip(delit_image, 0, 1) # Clip to valid range
+
+    # 3. Bilateral Filtering
+    delit_image_8bit = (delit_image * 255).astype(np.uint8) # Convert to 8-bit for OpenCV
+    delit_image_filtered = cv2.bilateralFilter(delit_image_8bit, d=9, sigmaColor=75, sigmaSpace=75)
+
+    # 4. CLAHE (Contrast Limited Adaptive Histogram Equalization)
+    lab = cv2.cvtColor(delit_image_filtered, cv2.COLOR_RGB2LAB)  # Convert to LAB color space
+    l, a, b = cv2.split(lab)  # Split into L, a, b channels
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    cl = clahe.apply(l)  # Apply CLAHE to the L channel
+    limg = cv2.merge((cl, a, b))  # Merge the channels back
+    delit_image_clahe = cv2.cvtColor(limg, cv2.COLOR_LAB2RGB)  # Convert back to RGB
+
+    # 5. Shadows/Highlights Adjustment (Simplified)
+    # Use the inverted depth map as a VERY rough mask for shadows/highlights
+    #  (This is a simplification - a proper implementation would need more sophisticated masking)
+    delit_image_clahe = delit_image_clahe.astype(np.float32) / 255.0 #important for streamlit
+    shadow_mask = depth_map_normalized
+    highlight_mask = 1 - depth_map_normalized
+
+    # Expand dimensions to make the masks 3D (matching the image)
+    shadow_mask = np.expand_dims(shadow_mask, axis=2)  # Add a channel dimension
+    highlight_mask = np.expand_dims(highlight_mask, axis=2)
+
+    # Adjust shadows and highlights (linear scaling)
+    shadow_factor = 1.2  # Brighten shadows
+    highlight_factor = 0.8  # Darken highlights
+
+    delit_image_final = delit_image_clahe * (1 + (shadow_mask * (shadow_factor - 1)))  # Apply shadow adjustment
+    delit_image_final = delit_image_final * (1 + (highlight_mask * (highlight_factor - 1)))  # Apply highlight adjustment
+    delit_image_final = np.clip(delit_image_final, 0, 1) # Ensure values stay within [0, 1]
+
+
+    return (delit_image_final * 255).astype(np.uint8) #convert back to 8 bit for display.
 
 # --- Streamlit App ---
-st.title("STORARO: STILL ANALYSIS")
+st.title("STORARO")
 
 uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "jpeg", "png"])
 
 if uploaded_file is not None:
-    # Read the file into a bytes object
     file_bytes = uploaded_file.read()
-    # Convert to a NumPy array
     file_bytes_np = np.frombuffer(file_bytes, dtype=np.uint8)
-    # Decode the image
     image = cv2.imdecode(file_bytes_np, cv2.IMREAD_COLOR)
 
     if image is not None:
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)  # Ensure RGB
-        yolo_model = load_yolo_model()  # Use consistent variable name
-        boxes, class_ids = detect_objects(image, yolo_model)  # Use yolo_model
-        annotated_image = draw_boxes_and_grid(image, boxes, class_ids, yolo_model)  # Use yolo_model
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        yolo_model = load_yolo_model()
+        boxes, class_ids = detect_objects(image, yolo_model)
+        annotated_image = draw_boxes_and_grid(image, boxes, class_ids, yolo_model)
         height, width, _ = image.shape
         grid_x = [width // 3, 2 * width // 3]
         grid_y = [height // 3, 2 * height // 3]
 
-        # Depth Estimation (Marigold)
         depth_map = estimate_depth_marigold(image)
         depth_colormap = visualize_depth(depth_map)
 
-        # --- Analysis ---
-        size_placement_results = analyze_object_size_and_placement(image, boxes, class_ids, yolo_model) # Use yolo_model
-        rule_of_thirds_results = perform_rule_of_thirds_analysis(boxes, class_ids, yolo_model, grid_x, grid_y) # Use yolo_model
-        depth_layer_results = perform_depth_layer_analysis(boxes, class_ids, yolo_model, depth_map) # Use yolo_model
+        delit_image = delight_image(image, depth_map)
 
-        # --- Display Results using st.columns ---
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         with col1:
             st.subheader("Object Detection and Rule of Thirds")
             st.image(annotated_image, use_container_width=True)
         with col2:
             st.subheader("Depth Map")
             st.image(depth_colormap, use_container_width=True)
-            # Add a colorbar (using Matplotlib)
             fig, ax = plt.subplots(figsize=(2, 0.5))
             norm = plt.Normalize(vmin=depth_map.min(), vmax=depth_map.max())
             cbar = fig.colorbar(plt.cm.ScalarMappable(norm=norm, cmap='viridis'), cax=ax, orientation='horizontal')
             cbar.set_label('Depth (Relative)')
-            st.pyplot(fig)  # Pass the figure object
+            st.pyplot(fig)
+        with col3:
+            st.subheader("Delit Image")
+            st.image(delit_image, use_container_width=True, channels = "BGR")
+
+        size_placement_results = analyze_object_size_and_placement(image, boxes, class_ids, yolo_model)
+        rule_of_thirds_results = perform_rule_of_thirds_analysis(boxes, class_ids, yolo_model, grid_x, grid_y)
+        depth_layer_results = perform_depth_layer_analysis(boxes, class_ids, yolo_model, depth_map)
 
         st.subheader("Analysis Results")
         st.markdown("**Object Size and Placement:**")
