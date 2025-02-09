@@ -2,19 +2,59 @@ import streamlit as st
 import cv2
 import numpy as np
 from ultralytics import YOLO
-from diffusers import MarigoldDepthPipeline
+#from diffusers import MarigoldDepthPipeline # No longer using Marigold
 import matplotlib.pyplot as plt
 import torch
+
+torch.classes.__path__ = []  # Workaround for Streamlit/PyTorch issue
 
 @st.cache_resource()
 def load_yolo_model():
     return YOLO('yolov8n.pt')
 
-@st.cache_resource()
-def load_marigold_model():
-    return MarigoldDepthPipeline.from_pretrained("prs-eth/marigold-depth-v1-0", torch_dtype=torch.float32)
+# @st.cache_resource() # No longer using marigold
+# def load_marigold_model():
+#     return MarigoldDepthPipeline.from_pretrained("prs-eth/marigold-depth-v1-0", torch_dtype=torch.float32)
 
-# ... (detect_objects, draw_boxes_and_grid, and other analysis functions remain the same) ...
+# --- MiDaS Model Loading ---
+@st.cache_resource()
+def load_midas_model():
+    model_type = "MiDaS_small"  # Or "MiDaS_large" or other options.  "MiDaS_small" is faster.
+    midas = torch.hub.load("intel-isl/MiDaS", model_type)
+    return midas
+
+# --- MiDaS Depth Estimation ---
+def estimate_depth_midas(image):
+    """Estimates depth using MiDaS."""
+    midas = load_midas_model()
+
+    # Use CUDA if available, otherwise use CPU
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    midas.to(device)
+    midas.eval()
+
+    # Load the appropriate transform based on the model type
+    midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
+    transform = midas_transforms.small_transform #hard coding transform
+
+    # Transform the image
+    img = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)  # MiDaS expects RGB input
+    input_batch = transform(img).to(device)
+
+    with torch.no_grad():
+        prediction = midas(input_batch)
+
+        # Resize to original image dimensions
+        prediction = torch.nn.functional.interpolate(
+            prediction.unsqueeze(1),
+            size=img.shape[:2],
+            mode="bicubic",
+            align_corners=False,
+        ).squeeze()
+
+    depth_map = prediction.cpu().numpy()
+    return depth_map
+
 def detect_objects(image, model):
     results = model(image)
     boxes = []
@@ -41,18 +81,19 @@ def draw_boxes_and_grid(image, boxes, class_ids, model):
         cv2.putText(annotated_image, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
     return annotated_image
 
-def estimate_depth_marigold(image):
-    """Estimates depth using Marigold."""
-    depth_estimator = load_marigold_model()
-    with torch.no_grad():
-        output = depth_estimator(image)
-        depth_map = output.prediction
-        depth_map = np.squeeze(depth_map)
-    return depth_map
+# def estimate_depth_marigold(image): #no longer using marigold
+#     """Estimates depth using Marigold."""
+#     depth_estimator = load_marigold_model()
+#     with torch.no_grad():
+#         output = depth_estimator(image)
+#         depth_map = output.prediction
+#         depth_map = np.squeeze(depth_map)
+#     return depth_map
 
 def visualize_depth(depth_map, colormap=cv2.COLORMAP_VIRIDIS):
     depth_colormap = cv2.applyColorMap(cv2.normalize(depth_map, None, 255, 0, cv2.NORM_MINMAX, cv2.CV_8U), colormap)
     return depth_colormap
+
 def calculate_object_depth_layer(depth_map, box, num_layers=3):
     x, y, w, h = box
     object_region = depth_map[y:y+h, x:x+w]
@@ -174,7 +215,7 @@ def delight_image(image, depth_map):
     # 5. Shadows/Highlights Adjustment (Simplified)
     # Use the inverted depth map as a VERY rough mask for shadows/highlights
     #  (This is a simplification - a proper implementation would need more sophisticated masking)
-    delit_image_clahe = delit_image_clahe.astype(np.float32) / 255.0 #important for streamlit
+    delit_image_clahe = delit_image_clahe.astype(np.float32) / 255.0
     shadow_mask = depth_map_normalized
     highlight_mask = 1 - depth_map_normalized
 
@@ -193,15 +234,72 @@ def delight_image(image, depth_map):
 
     return (delit_image_final * 255).astype(np.uint8) #convert back to 8 bit for display.
 
+def multiscale_retinex(img, sigma_list):
+    """Applies a simplified Multi-Scale Retinex (MSR) algorithm."""
+    img = img.astype(np.float32) / 255.0
+    retinex = np.zeros_like(img)
+    for sigma in sigma_list:
+        blurred = cv2.GaussianBlur(img, (0, 0), sigma)
+        retinex += np.log10(img + 0.01) - np.log10(blurred + 0.01)  # Avoid log(0)
+    retinex = retinex / len(sigma_list)
+    retinex = cv2.normalize(retinex, None, 0, 255, cv2.NORM_MINMAX)
+    return retinex.astype(np.uint8)
+
+def delight_guided_filter(image, depth_map, radius=15, eps=1e-3):
+    """Applies guided filtering for de-lighting, using the depth map as guidance."""
+
+    # Convert image to float32 and normalize
+    if image.dtype != np.float32:
+        image = image.astype(np.float32) / 255.0
+
+    # Normalize depth map and ensure correct type
+    guide = cv2.normalize(depth_map, None, 0, 1, cv2.NORM_MINMAX, dtype=cv2.CV_32F)
+    guide = np.squeeze(guide)
+    print(f"Guide shape: {guide.shape}, Guide type: {guide.dtype}")
+
+
+    # Convert guide to 3-channel if it's grayscale
+    if guide.ndim == 2:
+        guide = cv2.cvtColor(guide, cv2.COLOR_GRAY2BGR)
+
+
+    # Guided filtering on the *entire image* (all channels at once)
+    smoothed = cv2.ximgproc.guidedFilter(guide=guide, src=image, radius=radius, eps=eps, dDepth=-1)
+    print(f"Smoothed shape: {smoothed.shape}, Smoothed type: {smoothed.dtype}")
+
+
+    # Avoid division by zero
+    smoothed = np.maximum(smoothed, 1e-5)  # Add small constant
+
+    # Calculate reflectance in log domain
+    reflectance = np.log10(image + 0.01) - np.log10(smoothed + 0.01)
+    print(f"Reflectance shape: {reflectance.shape}, Reflectance type: {reflectance.dtype}")
+
+
+    # Normalize the result and convert to 8-bit for display.
+    reflectance = cv2.normalize(reflectance, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+    print(f"Reflectance shape after norm: {reflectance.shape}, Reflectance type after norm: {reflectance.dtype}")
+    return reflectance
+
 # --- Streamlit App ---
 st.title("STORARO")
 
 uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "jpeg", "png"])
 
+# Add sliders for guided filter parameters
+radius = st.slider("Guided Filter Radius", min_value=1, max_value=50, value=15, step=1)
+eps = st.slider("Guided Filter Epsilon (x 1e-3)", min_value=0.1, max_value=10.0, value=1.0, step=0.1)
+eps = eps * 1e-3  # Scale eps
+
+# Add a selection for de-lighting method
+delight_method = st.selectbox("Select De-lighting Method:", ["None", "Original (Depth-Based)", "MSR", "Guided Filter"])
+
+
 if uploaded_file is not None:
     file_bytes = uploaded_file.read()
     file_bytes_np = np.frombuffer(file_bytes, dtype=np.uint8)
     image = cv2.imdecode(file_bytes_np, cv2.IMREAD_COLOR)
+    print(f"Original Image shape: {image.shape}, Original Image type: {image.dtype}")
 
     if image is not None:
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -212,14 +310,16 @@ if uploaded_file is not None:
         grid_x = [width // 3, 2 * width // 3]
         grid_y = [height // 3, 2 * height // 3]
 
-        depth_map = estimate_depth_marigold(image)
+        # --- Switched to MiDaS ---
+        #depth_map = estimate_depth_marigold(image) #Using MiDaS Instead
+        depth_map = estimate_depth_midas(image) #using midas
+        print(f"Depth Map shape: {depth_map.shape}, Depth Map type: {depth_map.dtype}, Min value: {np.min(depth_map)}, Max value: {np.max(depth_map)}")
         depth_colormap = visualize_depth(depth_map)
 
-        delit_image = delight_image(image, depth_map)
-
-        col1, col2, col3 = st.columns(3)
+        # De-lighting options
+        col1, col2, col3, col4 = st.columns(4) #set up columns
         with col1:
-            st.subheader("Object Detection and Rule of Thirds")
+            st.subheader("Object Detection")
             st.image(annotated_image, use_container_width=True)
         with col2:
             st.subheader("Depth Map")
@@ -231,7 +331,25 @@ if uploaded_file is not None:
             st.pyplot(fig)
         with col3:
             st.subheader("Delit Image")
-            st.image(delit_image, use_container_width=True, channels = "BGR")
+            if delight_method == "Original (Depth-Based)":
+                delit_image = delight_image(image, depth_map)
+                st.image(delit_image, use_container_width=True, channels = "BGR")
+            elif delight_method == "None":
+                st.image(cv2.cvtColor(image, cv2.COLOR_RGB2BGR), use_container_width=True)
+            else:
+                st.empty()  # Placeholder for when no de-lighting is selected
+        with col4:
+            st.subheader("MSR/Guided Filter")
+            if delight_method == "MSR":
+                sigma_list = [15, 80, 250]
+                msr_image = multiscale_retinex(image, sigma_list)
+                st.image(msr_image, use_container_width=True, channels="BGR")
+            elif delight_method == "Guided Filter":
+                guided_delit_image = delight_guided_filter(image, depth_map, radius=radius, eps=eps) # Pass parameters
+                st.image(guided_delit_image, use_container_width=True, channels="BGR")
+            else:
+                st.empty()
+
 
         size_placement_results = analyze_object_size_and_placement(image, boxes, class_ids, yolo_model)
         rule_of_thirds_results = perform_rule_of_thirds_analysis(boxes, class_ids, yolo_model, grid_x, grid_y)
